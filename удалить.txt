@@ -1,0 +1,135 @@
+Ниже полная инструкция. Проверить её на сервере друга я не могу, поэтому после каждого шага есть проверка. Команды выполняются на VPS под root, везде замените `example.com` на свой домен.
+
+## Что нужно заранее
+
+- **VPS** с Ubuntu 22.04 или 24.04. Если его IP уже заблокирован из России, настройка не поможет: сначала смените IP у хостера.
+- **Домен.** Любой дешёвый, у любого регистратора. В DNS создайте A-запись на IP сервера, без проксирования через Cloudflare.
+- **Свободные порты** 80 и 443. Старые Hysteria и VLESS на 443 нужно остановить.
+
+## Шаг 1. Сайт и сертификат
+
+```bash
+apt update && apt install -y nginx certbot
+certbot certonly --webroot -w /var/www/html -d example.com \
+  --deploy-hook "systemctl reload nginx"
+```
+
+Положите в `/var/www/site/index.html` любую правдоподобную страницу (визитка, блог-заглушка), а не стандартную страницу nginx:
+
+```bash
+mkdir -p /var/www/site
+nano /var/www/site/index.html
+```
+
+Замените содержимое `/etc/nginx/sites-available/default` на:
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 127.0.0.1:8443 ssl http2;
+    server_name example.com;
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /var/www/site;
+    index index.html;
+}
+```
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+Сайт слушает только локальный порт 8443. Наружу на 443 будет смотреть Xray и отдавать этот сайт всем, у кого нет ключа.
+
+## Шаг 2. Xray и ключи
+
+```bash
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+xray uuid
+xray x25519
+openssl rand -hex 8
+```
+
+Сохраните четыре значения: UUID, приватный ключ, публичный ключ (в новых версиях он подписан как `Password`) и короткий ID из последней команды.
+
+## Шаг 3. Конфиг сервера
+
+Файл `/usr/local/etc/xray/config.json`:
+
+```json
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [ { "id": "ВАШ_UUID" } ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "target": "127.0.0.1:8443",
+          "xver": 0,
+          "serverNames": ["example.com"],
+          "privateKey": "ПРИВАТНЫЙ_КЛЮЧ",
+          "shortIds": ["КОРОТКИЙ_ID"]
+        },
+        "xhttpSettings": {
+          "path": "/api/v2/sync",
+          "mode": "auto"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" }
+  ]
+}
+```
+
+Путь `/api/v2/sync` замените на свой произвольный.
+
+```bash
+systemctl restart xray && systemctl status xray
+ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw enable
+```
+
+**Проверка:** откройте `https://example.com` в обычном браузере (вы из Финляндии, друг из России). Должен открыться ваш сайт с валидным сертификатом. Если так, маскировка работает.
+
+## Шаг 4. Клиент
+
+Ссылка для импорта (путь закодирован, `/` это `%2F`):
+
+```
+vless://ВАШ_UUID@example.com:443?type=xhttp&security=reality&sni=example.com&fp=chrome&pbk=ПУБЛИЧНЫЙ_КЛЮЧ&sid=КОРОТКИЙ_ID&path=%2Fapi%2Fv2%2Fsync&mode=auto&encryption=none#my-server
+```
+
+В настройках профиля найдите поле Extra (или XHTTP Extra) и вставьте:
+
+```json
+{ "xmux": { "maxConnections": 1 } }
+```
+
+Это ограничивает число параллельных соединений, по которым фильтр вычисляет прокси. Клиент должен быть на свежем ядре Xray: Happ, v2rayN (Windows) или v2rayNG (Android). Умеет ли Incy XHTTP и поле Extra, я не знаю, проверьте по списку протоколов в приложении.
+
+## Если не работает
+
+- **Сайт не открывается:** смотрите `journalctl -u xray -n 50` и `nginx -t`.
+- **Сайт открывается у вас, но не у друга:** IP заблокирован, нужна смена адреса.
+- **Подключается, но зависает через пару секунд:** попробуйте `fp=firefox` вместо `chrome` и проверьте, что Extra с xmux применился.
+- **В логе предупреждение про VLESS без flow:** работать будет. Следующий уровень защиты это VLESS Encryption (команда `xray vlessenc`), настроим отдельно, когда базовая схема заведётся.
+
+Ещё два совета: не держите на этом сервере ничего, кроме сайта и Xray, и не раздавайте ссылку другим людям.
+
+Напишите, на каком шаге остановитесь или что выдаст ошибку, разберём по логу.
